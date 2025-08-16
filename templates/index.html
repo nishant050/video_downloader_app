@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Video Downloader</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <h1 class="logo">VidExtract</h1>
+      <p class="subtitle">Paste a URL and download any video or audio quality.</p>
+    </header>
+
+    <main class="main">
+      <div class="card">
+        <div class="input-row">
+          <input id="url" placeholder="Paste video page URL here..." autofocus>
+          <button id="fetch">Fetch</button>
+        </div>
+        <div class="page-preview hidden">
+          <iframe id="page-frame" src="" title="page preview" sandbox="allow-scripts allow-forms allow-same-origin"></iframe>
+          <div id="preview-fallback" class="preview-fallback hidden">
+            <img id="preview-thumb" src="/static/img/placeholder.svg" alt="preview thumbnail">
+            <div class="preview-actions">
+              <a id="open-page" target="_blank" rel="noopener">Open page</a>
+              <button id="open-embed" type="button">Try embed</button>
+            </div>
+            <div class="preview-note">This site may refuse embedding; open in a new tab if playback fails.</div>
+          </div>
+        </div>
+        <div class="controls-row">
+          <div class="primary-actions">
+            <!-- primary controls (URL + fetch) already present -->
+          </div>
+          <div class="advanced-wrap">
+            <button id="adv-toggle" class="adv-toggle" aria-expanded="false">Advanced options <span class="caret">▾</span></button>
+            <div id="advanced" class="advanced">
+              <div class="adv-grid">
+                <label>Timeout (s)
+                  <input id="timeout" type="number" value="30" min="5" max="300">
+                </label>
+                <label>Retries
+                  <input id="retries" type="number" value="2" min="0" max="5">
+                </label>
+                <label>Proxy
+                  <input id="proxy" placeholder="optional e.g. http://127.0.0.1:8888">
+                </label>
+                <label>Method
+                  <select id="method">
+                    <option value="auto" selected>Auto (yt-dlp, then Playwright fallback)</option>
+                    <option value="yt-dlp">yt-dlp only (fast)</option>
+                    <option value="playwright">Playwright capture (browser)</option>
+                  </select>
+                </label>
+              </div>
+              <p class="adv-note">Use these only if a site is slow, blocked, or geo-restricted.</p>
+            </div>
+          </div>
+        </div>
+        <div id="status" class="status">Ready.</div>
+
+        <div id="result" class="result hidden">
+          <div class="meta">
+            <img id="thumb" src="" alt="thumbnail">
+            <div class="meta-text">
+              <h2 id="title"></h2>
+              <div class="meta-sub" id="meta-sub"></div>
+            </div>
+          </div>
+
+          <div class="formats">
+            <h3>Available formats</h3>
+            <div id="formats-list" class="formats-list"></div>
+            <div id="formats-controls" class="formats-controls hidden">
+              <label>Quality
+                <select id="quality-select"></select>
+              </label>
+              <label>Format
+                <select id="format-select"></select>
+              </label>
+              <button id="download-format">Download</button>
+            </div>
+          </div>
+
+          <div id="candidates" class="candidates hidden">
+            <h3>Captured direct URLs</h3>
+            <div id="candidates-list"></div>
+          </div>
+
+          <div class="audio-options">
+            <h3>Audio export</h3>
+            <div class="audio-controls">
+              <label>Bitrate
+                <select id="abr">
+                  <option value="64">64 kbps</option>
+                  <option value="128">128 kbps</option>
+                  <option value="192" selected>192 kbps</option>
+                  <option value="320">320 kbps</option>
+                </select>
+              </label>
+              <button id="download-audio">Download MP3</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <footer class="footer">Built with yt-dlp + ffmpeg • Local only</footer>
+    </main>
+  </div>
+
+  <script>
+  async function postJson(path, body){
+    const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    return r.json();
+  }
+  const $ = id => document.getElementById(id);
+  const status = $('status');
+  const result = $('result');
+  const formatsList = $('formats-list');
+  const formatsControls = $('formats-controls');
+  const qualitySelect = $('quality-select');
+  const formatSelect = $('format-select');
+  const downloadFormatBtn = $('download-format');
+  const pagePreview = document.querySelector('.page-preview');
+
+  // ensure preview hidden initially and clear any prior iframe src
+  if(pagePreview){
+    pagePreview.classList.add('hidden');
+    const f = $('page-frame'); if(f) { f.src = ''; f.classList.add('hidden'); }
+    const fb = $('preview-fallback'); if(fb) fb.classList.add('hidden');
+  }
+
+  // safe wiring for download-format button
+  if(downloadFormatBtn){
+    downloadFormatBtn.addEventListener('click', ()=>{
+      const val = formatSelect.value;
+      if(!val) return status.textContent = 'Choose a format first';
+      const parsed = JSON.parse(val);
+      const url = $('url').value.trim();
+      download({url, format_id: parsed.format_id, kind:'video', acodec: parsed.acodec});
+    });
+  }
+
+  $('fetch').addEventListener('click', async ()=>{
+    const url = $('url').value.trim();
+    if(!url) return status.textContent = 'Enter a URL.';
+  const timeout = Number($('timeout').value || 30);
+  const retries = Number($('retries').value || 2);
+  const proxy = $('proxy').value || undefined;
+  const method = $('method')? $('method').value : 'auto';
+    status.textContent = 'Fetching metadata...';
+  result.classList.add('hidden');
+  $('candidates').classList.add('hidden');
+  $('candidates-list').innerHTML = '';
+    try{
+  const r = await fetch('/api/extract', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url, timeout, retries, proxy, method})});
+      const res = await r.json();
+      if(r.status === 202 && res.job_id){
+        // Playwright job started — poll for candidates
+        status.textContent = 'Playwright capture started...';
+        pollPlayJob(res.job_id);
+        return;
+      }
+      // if server provides candidates synchronously
+      if(r.status === 207 && res.candidates){
+        if(Array.isArray(res.candidates) && res.candidates.length){
+          showCandidates(res.candidates);
+        } else {
+          // empty candidates
+          result.classList.remove('hidden');
+          $('candidates').classList.remove('hidden');
+          $('candidates-list').innerHTML = '<div class="candidate empty">No direct media URLs were captured.</div>';
+          status.textContent = res.error || 'No candidates found.';
+        }
+        return;
+      }
+      if(res.error){ status.textContent = 'Error: '+res.error; return; }
+      $('title').textContent = res.title || '';
+  $('thumb').src = res.thumbnail || '/static/img/placeholder.svg';
+      formatsList.innerHTML = '';
+      res.formats.sort((a,b)=> (b.height||b.tbr||0)-(a.height||a.tbr||0));
+
+      // group by quality label
+      const groups = {};
+      // only keep common media container formats
+      const allowedExt = new Set(['mp4','webm','m4a','mp3','opus','mkv','ts']);
+      res.formats.forEach(f=>{
+        if(!f.ext || !allowedExt.has(f.ext)) return; // skip mhtml/storyboard/other
+        const q = f.height? (f.height+'p') : (f.ext === 'm4a' || f.ext === 'mp3' || f.acodec? 'audio' : 'audio');
+        groups[q] = groups[q] || [];
+        groups[q].push(f);
+      });
+
+      // populate quality select and summary list
+      qualitySelect.innerHTML = '';
+      Object.keys(groups).forEach(q=>{
+        const opt = document.createElement('option'); opt.value = q; opt.textContent = q; qualitySelect.appendChild(opt);
+      });
+
+      formatsList.innerHTML = '';
+      Object.entries(groups).forEach(([q, items])=>{
+        const el = document.createElement('div'); el.className='format';
+        const label = `${q} — ${[...new Set(items.map(i=>i.ext))].join(', ')}`;
+        el.innerHTML = `<div class="fmt-left">${label}</div><div class="fmt-right"><button data-quality="${q}">Choose</button></div>`;
+        formatsList.appendChild(el);
+        el.querySelector('button').addEventListener('click', ()=> { qualitySelect.value = q; qualitySelect.dispatchEvent(new Event('change')); formatsControls.classList.remove('hidden'); });
+      });
+
+      function populateFormatsForQuality(){
+        const q = qualitySelect.value;
+        const items = groups[q] || [];
+        formatSelect.innerHTML = '';
+        items.forEach(i=>{
+          const opt = document.createElement('option'); opt.value = JSON.stringify({format_id:i.format_id,acodec:i.acodec,ext:i.ext}); opt.textContent = `${i.ext} ${i.format_note||''} ${(i.filesize? (Math.round(i.filesize/1024/1024*10)/10+'MB'):'')}`;
+          formatSelect.appendChild(opt);
+        });
+      }
+      qualitySelect.addEventListener('change', populateFormatsForQuality);
+      if(Object.keys(groups).length){ qualitySelect.value = Object.keys(groups)[0]; populateFormatsForQuality(); formatsControls.classList.remove('hidden'); }
+
+      result.classList.remove('hidden');
+      status.textContent = 'Ready — choose a quality to download.';
+      // populate meta-sub (uploader + duration)
+      const meta = [];
+      if(res.uploader) meta.push(res.uploader);
+      if(res.duration) meta.push(Math.round(res.duration/60)+'m');
+      $('meta-sub').textContent = meta.join(' • ');
+      // show preview fallback (thumbnail + open/try buttons) by default
+      const frame = $('page-frame');
+      const fallback = $('preview-fallback');
+      const openPage = $('open-page');
+      const openEmbed = $('open-embed');
+      if(frame) frame.src = ''; // clear previous
+      if(fallback){
+        // set thumbnail and open link
+        $('preview-thumb').src = res.thumbnail || '/static/img/placeholder.svg';
+        openPage.href = url;
+        // show fallback and hide iframe until user requests embed
+        pagePreview.classList.remove('hidden');
+        fallback.classList.remove('hidden');
+        if(frame) frame.classList.add('hidden');
+
+        // wire Try embed: attempt known embed transforms (YouTube, TikTok), otherwise try direct
+        openEmbed.onclick = ()=>{
+          let embedUrl = null;
+          try{
+            const y = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)([A-Za-z0-9_-]{6,})/i);
+            if(y) embedUrl = 'https://www.youtube.com/embed/'+y[1]+'?rel=0';
+            const t = url.match(/tiktok\.com\/(?:@[^\/]+\/video\/\d+)/i);
+            if(!embedUrl && t) embedUrl = url.replace(/www\./,''); // tiktok embed often works with /embed/ but varies
+          }catch(e){ /* ignore regex errors */ }
+          if(!embedUrl) embedUrl = url;
+          if(frame){
+            frame.src = embedUrl;
+            frame.classList.remove('hidden');
+            fallback.classList.add('hidden');
+            // if embedding fails (blank), revert to fallback after short delay
+            const onLoadCheck = ()=>{
+              setTimeout(()=>{
+                try{
+                  const doc = frame.contentDocument || frame.contentWindow.document;
+                  const hasBody = doc && doc.body && doc.body.innerHTML && doc.body.innerHTML.trim().length>0;
+                  if(!hasBody){
+                    frame.classList.add('hidden');
+                    fallback.classList.remove('hidden');
+                    status.textContent = 'Embed failed — use Open page to open in a new tab.';
+                  }
+                }catch(e){
+                  // cross-origin access throws; assume embed succeeded
+                }
+              }, 900);
+            };
+            frame.addEventListener('load', onLoadCheck, {once:true});
+          }
+        };
+      }
+    }catch(err){ status.textContent = 'Error: '+err.message; }
+  });
+
+  async function download(params){
+    status.textContent = 'Starting download job...';
+    try{
+      // attach tuning params
+  params.timeout = Number($('timeout').value || 60);
+  params.retries = Number($('retries').value || 2);
+  params.proxy = $('proxy').value || undefined;
+  params.method = $('method')? $('method').value : 'auto';
+  // include acodec when provided (for merging audio if necessary)
+  if(params.acodec === undefined && params.format_id){ params.acodec = '' }
+      const r = await fetch('/api/download', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(params)});
+      const j = await r.json();
+      if(r.status === 207){
+        // Playwright ran and returned candidates (maybe empty)
+        if(Array.isArray(j.candidates) && j.candidates.length){
+          showCandidates(j.candidates);
+          return;
+        } else {
+          status.textContent = j.error || 'No candidates found by Playwright.';
+          return;
+        }
+      }
+      if(!r.ok){ status.textContent = 'Server error: '+(j.error||r.statusText); return; }
+      const jobId = j.job_id;
+      // show progress UI
+      showProgress(jobId);
+    }catch(err){ status.textContent = 'Error: '+err.message; }
+  }
+
+  function showCandidates(candidates){
+  // reveal the main result area and the candidates panel
+  result.classList.remove('hidden');
+  $('candidates').classList.remove('hidden');
+  const list = $('candidates-list'); list.innerHTML = '';
+    candidates.forEach(c=>{
+      const el = document.createElement('div'); el.className='candidate';
+      el.innerHTML = `<div class="cand-url">${c.url}</div><div class="cand-actions"><button data-url="${c.url}">Download</button></div>`;
+      list.appendChild(el);
+      el.querySelector('button').addEventListener('click', ()=> download({url: c.url, kind:'video'}));
+    });
+  status.textContent = 'Captured direct URLs — choose one to download.';
+  // bring candidates into view
+  const el = $('candidates'); if(el) el.scrollIntoView({behavior:'smooth', block:'center'});
+  }
+
+  async function pollPlayJob(jobId){
+    const interval = setInterval(async ()=>{
+      try{
+        const r = await fetch('/api/playjob/'+jobId);
+        if(!r.ok){ clearInterval(interval); status.textContent = 'Play job error'; return; }
+        const s = await r.json();
+        status.textContent = 'Playwright: '+s.status;
+        if(s.status === 'finished'){
+          clearInterval(interval);
+          showCandidates(s.candidates || []);
+        }
+        if(s.status === 'error'){
+          clearInterval(interval);
+          status.textContent = 'Play job failed: '+(s.error||'unknown');
+        }
+      }catch(err){ clearInterval(interval); status.textContent = 'Play job poll error: '+err.message; }
+    }, 1500);
+  }
+
+  // progress UI helpers
+  function showProgress(jobId){
+    status.textContent = 'Queued...';
+    let box = document.getElementById('progress-'+jobId);
+    if(!box){
+      box = document.createElement('div'); box.id = 'progress-'+jobId; box.className = 'progress-box';
+      box.innerHTML = `<div class="progress-label">Job: ${jobId}</div><div class="progress-bar"><div class="progress-fill" style="width:0%"></div></div><div class="progress-meta"></div>`;
+      formatsList.parentElement.appendChild(box);
+    }
+
+    const interval = setInterval(async ()=>{
+      try{
+        const r = await fetch('/api/status/'+jobId);
+        if(!r.ok){ clearInterval(interval); status.textContent = 'Status error'; return; }
+        const s = await r.json();
+        const fill = box.querySelector('.progress-fill');
+        const meta = box.querySelector('.progress-meta');
+  fill.style.width = (s.progress||0) + '%';
+  let note = s.note? ' • '+s.note : '';
+  meta.textContent = `${s.status}${s.speed? ' • '+(Math.round((s.speed||0)/1024))+' KB/s':''}${s.eta? ' • ETA: '+s.eta+'s':''}${s.error? ' • ERR: '+s.error:''}${note}`;
+        status.textContent = `Job ${jobId}: ${s.status}`;
+        if(s.status === 'finished'){
+          clearInterval(interval);
+          const a = document.createElement('a');
+          a.href = '/api/file/'+jobId; a.textContent = 'Download file'; a.className = 'download-link';
+          box.appendChild(a);
+          status.textContent = 'Ready to download.';
+        }
+        if(s.status === 'error'){
+          clearInterval(interval);
+          status.textContent = 'Job failed: '+(s.error||'unknown');
+        }
+      }catch(err){ clearInterval(interval); status.textContent = 'Progress error: '+err.message; }
+    }, 1500);
+  }
+
+  $('download-audio').addEventListener('click', ()=>{
+    const url = $('url').value.trim();
+    const abr = $('abr').value;
+    if(!url) return status.textContent = 'Enter a URL.';
+    download({url, kind: 'audio', abr});
+  });
+
+  // advanced toggle
+  const advToggle = $('adv-toggle');
+  const advPane = $('advanced');
+  if(advToggle){
+    advToggle.addEventListener('click', ()=>{
+      const open = advPane.classList.toggle('open');
+      advToggle.setAttribute('aria-expanded', open? 'true':'false');
+      advToggle.querySelector('.caret').style.transform = open? 'rotate(180deg)' : 'rotate(0deg)';
+    });
+  }
+  </script>
+</body>
+</html>

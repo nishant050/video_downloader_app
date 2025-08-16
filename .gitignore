@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+env/
+.env
+/.vscode/
+node_modules/
+.DS_Store
+*.log
+dist/
+build/
+.pytest_cache/
+
+# byte-compiled / optimized / DLL files
+*.pyc
+*.pyo
+*.pyd
+
+# distribution
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
