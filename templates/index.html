@@ -53,6 +53,7 @@
                     <option value="auto" selected>Auto (yt-dlp, then Playwright fallback)</option>
                     <option value="yt-dlp">yt-dlp only (fast)</option>
                     <option value="playwright">Playwright capture (browser)</option>
+                    <option value="selenium">Selenium capture (experimental)</option>
                   </select>
                 </label>
               </div>
@@ -159,9 +160,10 @@
   const r = await fetch('/api/extract', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url, timeout, retries, proxy, method})});
       const res = await r.json();
       if(r.status === 202 && res.job_id){
-        // Playwright job started — poll for candidates
-        status.textContent = 'Playwright capture started...';
-        pollPlayJob(res.job_id);
+        // capture job started — poll for candidates (method-sensitive)
+        const verb = method && method !== 'auto' ? method : 'playwright';
+        status.textContent = (verb.charAt(0).toUpperCase()+verb.slice(1)) + ' capture started...';
+        pollCaptureJob(res.job_id, verb);
         return;
       }
       // if server provides candidates synchronously
@@ -325,22 +327,22 @@
   const el = $('candidates'); if(el) el.scrollIntoView({behavior:'smooth', block:'center'});
   }
 
-  async function pollPlayJob(jobId){
+  async function pollCaptureJob(jobId, methodName='playwright'){
     const interval = setInterval(async ()=>{
       try{
         const r = await fetch('/api/playjob/'+jobId);
-        if(!r.ok){ clearInterval(interval); status.textContent = 'Play job error'; return; }
+        if(!r.ok){ clearInterval(interval); status.textContent = methodName+' job error'; return; }
         const s = await r.json();
-        status.textContent = 'Playwright: '+s.status;
+        status.textContent = (methodName.charAt(0).toUpperCase()+methodName.slice(1)) + ': '+s.status;
         if(s.status === 'finished'){
           clearInterval(interval);
           showCandidates(s.candidates || []);
         }
         if(s.status === 'error'){
           clearInterval(interval);
-          status.textContent = 'Play job failed: '+(s.error||'unknown');
+          status.textContent = methodName+' job failed: '+(s.error||'unknown');
         }
-      }catch(err){ clearInterval(interval); status.textContent = 'Play job poll error: '+err.message; }
+      }catch(err){ clearInterval(interval); status.textContent = methodName+' job poll error: '+err.message; }
     }, 1500);
   }
 

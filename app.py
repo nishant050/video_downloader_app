@@ -78,6 +78,27 @@ def extract():
         t = threading.Thread(target=play_job, daemon=True)
         t.start()
         return jsonify({'job_id': job_id}), 202
+    if method == 'selenium':
+        # start background selenium capture job and return job id
+        job_id = uuid.uuid4().hex
+        with PLAY_LOCK:
+            PLAY_JOBS[job_id] = {'status': 'queued', 'candidates': None, 'error': None}
+
+        def sel_job():
+            try:
+                with PLAY_LOCK:
+                    PLAY_JOBS[job_id]['status'] = 'running'
+                candidates = run_selenium_capture(url, timeout=timeout, proxy=proxy)
+                with PLAY_LOCK:
+                    PLAY_JOBS[job_id].update({'status': 'finished', 'candidates': candidates})
+            except Exception as e:
+                logger.exception('selenium job failed')
+                with PLAY_LOCK:
+                    PLAY_JOBS[job_id].update({'status': 'error', 'error': str(e)})
+
+        t = threading.Thread(target=sel_job, daemon=True)
+        t.start()
+        return jsonify({'job_id': job_id}), 202
 
     for attempt in range(retries + 1):
         ydl_opts = dict(base_opts)
@@ -206,6 +227,117 @@ def run_playwright_capture(url, timeout=30, proxy=None):
     return candidates
 
 
+def run_selenium_capture(url, timeout=30, proxy=None):
+    """Attempt to capture direct media URLs using Selenium (Chrome/Chromium).
+    This is experimental and kept as a fallback option when Playwright is not desired.
+    """
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+    except Exception:
+        raise RuntimeError('selenium not installed; install with "pip install selenium" and ensure chromedriver is available')
+
+    opts = Options()
+    # Use new headless if supported, else fallback
+    try:
+        opts.add_argument('--headless=new')
+    except Exception:
+        opts.add_argument('--headless')
+    # common stability flags
+    opts.add_argument('--disable-gpu')
+    opts.add_argument('--no-sandbox')
+    opts.add_argument('--disable-dev-shm-usage')
+    opts.add_argument('--disable-extensions')
+    opts.add_argument('--disable-background-timer-throttling')
+    opts.add_argument('--disable-renderer-backgrounding')
+    if proxy:
+        opts.add_argument(f'--proxy-server={proxy}')
+
+    driver = None
+    # try to instantiate webdriver.Chrome; if not available, try webdriver-manager to obtain a driver
+
+        try:
+            try:
+                driver = webdriver.Chrome(options=opts)
+            except Exception:
+                # attempt to use webdriver-manager to download a matching chromedriver
+                try:
+                    from webdriver_manager.chrome import ChromeDriverManager
+                    driver = webdriver.Chrome(ChromeDriverManager().install(), options=opts)
+                except Exception:
+                    raise
+
+        # navigate with a moderate timeout and then poll for video element presence
+        try:
+            # allow a longer load timeout to avoid renderer timeouts on heavy pages
+            driver.set_page_load_timeout(max(30, timeout))
+            driver.get(url)
+        except Exception:
+            # navigation may time out on heavy pages; continue and try to wait for elements
+            pass
+
+        # wait for any video element to appear (short wait)
+        try:
+            WebDriverWait(driver, min(10, timeout)).until(EC.presence_of_element_located((By.TAG_NAME, 'video')))
+        except Exception:
+            # still continue even if no video element appears
+            pass
+
+        candidates = []
+        seen = set()
+
+        # try to extract video tags and their srcs
+        try:
+            videos = driver.find_elements(By.TAG_NAME, 'video')
+            for v in videos:
+                try:
+                    src = v.get_attribute('src')
+                    if src and src not in seen:
+                        seen.add(src)
+                        candidates.append({'url': src, 'content_type': None})
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # fallback: inspect network via performance logs if available (best-effort)
+        try:
+            # many chromedriver setups don't expose network logs; ignore failures
+            logs = driver.get_log('performance')
+            for entry in logs:
+                import json
+                try:
+                    msg = json.loads(entry.get('message', '{}'))
+                    params = msg.get('message', {}).get('params', {})
+                    message = params.get('message') or {}
+                    if message.get('method') == 'Network.responseReceived':
+                        r = message.get('params', {}).get('response', {})
+                        rurl = r.get('url')
+                        ctype = r.get('mimeType')
+                        if rurl and (rurl.endswith(('.mp4', '.m3u8', '.webm', '.m4a', '.mp3', '.ts')) or (ctype and (ctype.startswith('video') or ctype.startswith('audio')))):
+                            if rurl not in seen:
+                                seen.add(rurl)
+                                candidates.append({'url': rurl, 'content_type': ctype})
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    # very small delay to allow lazy-loaded players to fetch
+    time.sleep(1)
+
+    return candidates
+    finally:
+        try:
+            if driver:
+                driver.quit()
+        except Exception:
+            pass
+
+
 @app.route('/api/playjob/<job_id>', methods=['GET'])
 def playjob_status(job_id):
     with PLAY_LOCK:
@@ -234,9 +366,12 @@ def api_download():
     method = data.get('method', 'auto')
 
     # if user requested playwright for download, try capture first and set url to candidate
-    if method == 'playwright':
+    if method == 'playwright' or method == 'selenium':
         try:
-            candidates = run_playwright_capture(url, timeout=timeout, proxy=proxy)
+            if method == 'playwright':
+                candidates = run_playwright_capture(url, timeout=timeout, proxy=proxy)
+            else:
+                candidates = run_selenium_capture(url, timeout=timeout, proxy=proxy)
             if candidates:
                 # pick first candidate URL
                 url = candidates[0]['url']
